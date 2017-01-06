@@ -233,11 +233,11 @@ VOID WINAPI USBClerk::main(DWORD argc, TCHAR* argv[])
     TCHAR path[MAX_PATH];
 
     if (GetTempPath(MAX_PATH, path)) {
-        _sntprintf(log_path, MAX_PATH, USB_CLERK_LOG_PATH, path);
+        swprintf_s(log_path, MAX_PATH, USB_CLERK_LOG_PATH, path);
         s->_log = VDLog::get(log_path);
     }
     if (GetSystemDirectory(path, MAX_PATH)) {
-        _snprintf(s->_wdi_path, MAX_PATH, USB_DRIVER_PATH, path);
+        sprintf_s(s->_wdi_path, MAX_PATH, USB_DRIVER_PATH, path);
     }
     vd_printf("***Service started***");
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
@@ -464,7 +464,7 @@ bool USBClerk::install_winusb_driver(int vid, int pid)
     vd_printf("Device %04x:%04x found", vid, pid);
 
     /* inf filename is built out of vid and pid */
-    r = snprintf(infname, sizeof(infname), "usb_device_%04x_%04x.inf", vid, pid);
+    r = sprintf_s(infname, sizeof(infname), "usb_device_%04x_%04x.inf", vid, pid);
     if (r <= 0) {
         vd_printf("inf file naming failed (%d)", r);
         goto cleanup;
@@ -506,31 +506,146 @@ cleanup:
     return installed;
 }
 
-bool USBClerk::remove_winusb_driver(int vid, int pid)
+bool RemoveDriver(CHAR *HardwareID)
 {
-    HDEVINFO devs;
-    SP_DEVINFO_DATA dev_info;
-    bool installed;
-    bool ret = false;
+	HDEVINFO DeviceInfoSet;
+	SP_DEVINFO_DATA DeviceInfoData;
+	DWORD i;
+	bool is_remove = false;
 
-    devs = SetupDiGetClassDevs(NULL, L"USB", NULL, DIGCF_ALLCLASSES);
-    if (devs == INVALID_HANDLE_VALUE) {
-        vd_printf("SetupDiGetClassDevsEx failed: %ld", GetLastError());
-        return false;
-    }
-    if (get_dev_info(devs, vid, pid, &dev_info, &installed)) {
-        if (installed) {
-            vd_printf("Removing %04x:%04x", vid, pid);
-            if (uninstall_inf(devs, &dev_info)) {
-                ret = remove_dev(devs, &dev_info);
-            }
-        } else {
-            vd_printf("WinUSB driver is not installed");
-        }
-    }
-    SetupDiDestroyDeviceInfoList(devs);
+	DeviceInfoSet = SetupDiGetClassDevs(NULL, // All Classes
+		0,
+		0,
+		DIGCF_ALLCLASSES | DIGCF_PRESENT ); // All devices present on system
+	if (DeviceInfoSet == INVALID_HANDLE_VALUE)
+	{
+		return false;
+	}
+	//
+	//  Enumerate through all Devices.
+	//
+	DeviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+	for (i=0;SetupDiEnumDeviceInfo(DeviceInfoSet,i,&DeviceInfoData);i++)
+	{
+		DWORD DataT;
+		PSTR p,buffer = NULL;
+		DWORD buffersize = 0;
+		//
+		// We won't know the size of the HardwareID buffer until we call
+		// this function. So call it with a null to begin with, and then
+		// use the required buffer size to Alloc the nessicary space.
+		// Keep calling we have success or an unknown failure.
+		//
+		while (!SetupDiGetDeviceRegistryPropertyA(
+			DeviceInfoSet,
+			&DeviceInfoData,
+			SPDRP_HARDWAREID,
+			&DataT,
+			(PBYTE)buffer,
+			buffersize,
+			&buffersize))
+		{
+			if (GetLastError() == ERROR_INVALID_DATA)
+			{
+				//
+				// May be a Legacy Device with no HardwareID. Continue.
+				//
+				break;
+			}
+			else if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+			{
+				//
+				// We need to change the buffer size.
+				//
+				if (buffer)
+					LocalFree(buffer);
+				buffer = (CHAR *)LocalAlloc(LPTR,buffersize);
+			}
+			else
+			{
+				//
+				// Unknown Failure.
+				//
+				goto cleanup_DeviceInfo;
+			}
+		}
+		if (GetLastError() == ERROR_INVALID_DATA)
+			continue;
+		//
+		// Compare each entry in the buffer multi-sz list with our HardwareID.
+
+		//
+		for (p=buffer;*p&&(p<&buffer[buffersize]);p+=strlen(p)+sizeof(CHAR))
+		{
+			if (strstr(p,HardwareID))
+			{
+				vd_printf("Found! [%s]",p);
+
+				HKEY hDev = NULL;
+				hDev = SetupDiOpenDevRegKey(DeviceInfoSet,&DeviceInfoData,DICS_FLAG_GLOBAL,0,DIREG_DRV,KEY_READ);
+				if (hDev == INVALID_HANDLE_VALUE)
+				{
+					goto cleanup_DeviceInfo;
+				}
+
+				TCHAR InfName[20] = {0};
+				DWORD slen = 20;
+				DWORD type;
+				LONG ret = RegQueryValueEx(hDev,L"InfPath",NULL,&type,(LPBYTE)InfName,&slen);
+				if (ret != ERROR_SUCCESS)
+				{
+					RegCloseKey(hDev);
+					goto cleanup_DeviceInfo;
+				}
+				RegCloseKey(hDev);
+
+				if (!SetupUninstallOEMInf(InfName, SUOI_FORCEDELETE, NULL)) {
+
+					goto cleanup_DeviceInfo;
+				}
+
+				vd_printf("delete inf success!");
+
+				if (!SetupDiCallClassInstaller(DIF_REMOVE,
+					DeviceInfoSet,
+					&DeviceInfoData))
+				{
+					goto cleanup_DeviceInfo;
+				}
+
+				is_remove = true;
+
+				vd_printf("Uninstall driver success!");
+
+				break;
+			}
+		}
+		if (buffer) LocalFree(buffer);
+
+		if (is_remove)
+			break;
+	}
+	
+	//
+	//  Cleanup.
+	//
+cleanup_DeviceInfo:
+	SetupDiDestroyDeviceInfoList(DeviceInfoSet);
+	return is_remove;
+
+}
+
+bool USBClerk::remove_winusb_driver(int vid, int pid)
+{	
+	CHAR HardId[128] = {0};
+	sprintf(HardId,"USB\\VID_%04X&PID_%04X",vid,pid);
+
+	vd_printf("remove usb device:%s",HardId);
+
+	bool ret = RemoveDriver(HardId);
     ret = ret && rescan();
-    return ret;
+    
+	return ret;
 }
 
 bool USBClerk::uninstall_inf(HDEVINFO devs, PSP_DEVINFO_DATA dev_info)
